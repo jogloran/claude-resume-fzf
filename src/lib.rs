@@ -15,6 +15,7 @@ struct Session {
     label: String,
     /// Flattened transcript text (prompts + replies) for full-text search.
     haystack: String,
+    branch: Option<String>,
     mtime: u64,
     file: PathBuf,
 }
@@ -91,6 +92,7 @@ fn parse_session(file: PathBuf, full: bool) -> Option<Session> {
     let reader = BufReader::new(f);
 
     let mut cwd: Option<String> = None;
+    let mut branch: Option<String> = None;
     let mut title: Option<String> = None;
     let mut prompt: Option<String> = None;
     let mut haystack = String::new();
@@ -110,6 +112,11 @@ fn parse_session(file: PathBuf, full: bool) -> Option<Session> {
         if cwd.is_none() {
             if let Some(c) = v.get("cwd").and_then(Value::as_str) {
                 cwd = Some(c.to_string());
+                branch = v
+                    .get("gitBranch")
+                    .and_then(Value::as_str)
+                    .filter(|b| !b.is_empty())
+                    .map(String::from);
             }
         }
         if let Some(ts) = v.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339) {
@@ -161,6 +168,7 @@ fn parse_session(file: PathBuf, full: bool) -> Option<Session> {
         cwd,
         label,
         haystack,
+        branch,
         mtime: last_activity.unwrap_or(file_mtime),
         file,
     })
@@ -277,7 +285,23 @@ fn truncate(s: &str, max: usize) -> String {
 // ANSI colors for the fzf list.
 const DIM: &str = "\x1b[90m";
 const CYAN: &str = "\x1b[36m";
+const MAGENTA: &str = "\x1b[35m";
 const RESET: &str = "\x1b[0m";
+
+/// Render one session's visible list row: relative time, directory, git
+/// branch (if any, in its own color), and label.
+fn format_row(s: &Session) -> String {
+    let branch = match &s.branch {
+        Some(b) => format!(" {MAGENTA}[{b}]{RESET}"),
+        None => String::new(),
+    };
+    format!(
+        "{DIM}{:>4}{RESET}  {CYAN}{}{RESET}{branch}  {}",
+        rel_time(s.mtime),
+        tilde(&s.cwd),
+        truncate(&s.label, 80),
+    )
+}
 
 /// Interactive picker: list sessions in fzf, then resume the chosen one.
 /// When `full` is set, the whole transcript is searchable; otherwise fzf
@@ -297,12 +321,7 @@ pub fn run(full: bool) -> ! {
     // Build tab-delimited input: display col + hidden cwd/id/file cols.
     let mut input = String::new();
     for s in &sessions {
-        let display = format!(
-            "{DIM}{:>4}{RESET}  {CYAN}{}{RESET}  {}",
-            rel_time(s.mtime),
-            tilde(&s.cwd),
-            truncate(&s.label, 80),
-        );
+        let display = format_row(s);
         // In full mode the haystack trails the visible label so fzf searches
         // the whole transcript; it sits off-screen (with --no-hscroll) and dimmed.
         let searchable = if full {
@@ -334,7 +353,7 @@ pub fn run(full: bool) -> ! {
             },
             "--height=100%",
             "--layout=reverse",
-            "--preview-window=down:60%:wrap",
+            "--preview-window=down:60%:wrap:follow",
         ])
         // Fuzzy matching over a 20 KB transcript blob matches almost everything,
         // so full-text mode uses exact substring matching instead.
@@ -664,6 +683,55 @@ mod tests {
         assert_eq!(s.mtime, 1_790_026_993);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_session_captures_git_branch() {
+        let dir = std::env::temp_dir().join(format!("crf-branch-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("33333333-4444-5555-6666-777777777777.jsonl");
+        let body = json!({
+            "type": "user",
+            "cwd": "/tmp",
+            "gitBranch": "feature/foo",
+            "message": {"content": "hi"},
+        })
+        .to_string();
+        fs::write(&file, body).unwrap();
+
+        let s = parse_session(file.clone(), false).expect("session parsed");
+        assert_eq!(s.branch.as_deref(), Some("feature/foo"));
+
+        // Empty gitBranch (detached HEAD / non-git dir) should surface as None.
+        let file2 = dir.join("44444444-5555-6666-7777-888888888888.jsonl");
+        let body2 = json!({"type": "user", "cwd": "/tmp", "gitBranch": "", "message": {"content": "hi"}})
+            .to_string();
+        fs::write(&file2, body2).unwrap();
+        let s2 = parse_session(file2, false).expect("session parsed");
+        assert_eq!(s2.branch, None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn format_row_colors_branch_separately_from_dir() {
+        let cwd = home().join("proj").to_string_lossy().into_owned();
+        let s = Session {
+            id: "id".into(),
+            cwd,
+            label: "Fix the bug".into(),
+            haystack: String::new(),
+            branch: Some("feature/foo".into()),
+            mtime: 0,
+            file: PathBuf::from("/dev/null"),
+        };
+        let row = format_row(&s);
+        assert!(row.contains(&format!("{CYAN}~/proj{RESET}")));
+        assert!(row.contains(&format!("{MAGENTA}[feature/foo]{RESET}")));
+
+        let mut no_branch = s;
+        no_branch.branch = None;
+        assert!(!format_row(&no_branch).contains(MAGENTA));
     }
 
     #[test]
