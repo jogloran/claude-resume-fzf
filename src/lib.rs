@@ -413,20 +413,47 @@ pub fn preview(file: &str, query: &str) {
     if let Some(ver) = &version {
         let _ = writeln!(out, "{CYAN}claude:{RESET} {ver}");
     }
+    let width = preview_width();
     if let Some(lp) = &last_prompt {
-        let _ = writeln!(
-            out,
-            "{CYAN}latest:{RESET} {}",
-            highlight(&truncate(lp, 200), query)
-        );
+        write_wrapped(&mut out, "latest:", CYAN, &truncate(lp, 800), query, width);
     }
     let _ = writeln!(out, "{DIM}{}{RESET}", "─".repeat(40));
     for (label, color, text) in turns.iter().take(40) {
-        let _ = writeln!(
-            out,
-            "{color}{label}:{RESET} {}",
-            highlight(&truncate(text, 300), query)
-        );
+        write_wrapped(&mut out, &format!("{label}:"), color, &truncate(text, 1200), query, width);
+    }
+}
+
+/// Preview pane width, as fzf reports it via `FZF_PREVIEW_COLUMNS`; falls
+/// back to 80 when unset or unparsable (e.g. run outside fzf for testing).
+fn preview_width() -> usize {
+    std::env::var("FZF_PREVIEW_COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&w| w > 10)
+        .unwrap_or(80)
+}
+
+/// Word-wrap `text` to `width` columns, printing a `label:` prefix on the
+/// first line and aligning continuation lines under it. Wrapping happens
+/// before highlighting so embedded ANSI codes never skew the wrap width.
+fn write_wrapped(
+    out: &mut impl Write,
+    label: &str,
+    color: &str,
+    text: &str,
+    query: &str,
+    width: usize,
+) {
+    let prefix = format!("{label} ");
+    let indent = " ".repeat(prefix.chars().count());
+    let body_width = width.saturating_sub(indent.len()).max(10);
+    for (i, line) in textwrap::wrap(text, body_width).iter().enumerate() {
+        let hl = highlight(line, query);
+        if i == 0 {
+            let _ = writeln!(out, "{color}{prefix}{RESET}{hl}");
+        } else {
+            let _ = writeln!(out, "{indent}{hl}");
+        }
     }
 }
 

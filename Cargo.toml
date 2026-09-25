@@ -23,6 +23,7 @@ path = "src/bin/ccresume.rs"
 
 [dependencies]
 serde_json = "1"
+textwrap = "0.16"
 
 [profile.release]
 strip = true
