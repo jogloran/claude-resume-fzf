@@ -80,7 +80,7 @@ fn text_from_content(content: &Value) -> Option<String> {
 /// The full transcript haystack is only built when `full` search is requested.
 fn parse_session(file: PathBuf, full: bool) -> Option<Session> {
     let id = file.file_stem()?.to_string_lossy().into_owned();
-    let mtime = fs::metadata(&file)
+    let file_mtime = fs::metadata(&file)
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -94,6 +94,11 @@ fn parse_session(file: PathBuf, full: bool) -> Option<Session> {
     let mut title: Option<String> = None;
     let mut prompt: Option<String> = None;
     let mut haystack = String::new();
+    // Last real transcript activity, from each line's own `timestamp` field.
+    // Bookkeeping lines appended well after a session ends (cost-state,
+    // last-prompt, ai-title, ...) carry no timestamp and are ignored here,
+    // so they can't make a stale session look freshly used.
+    let mut last_activity: Option<u64> = None;
 
     // Scan the whole file: the `ai-title` entry is written late in a session,
     // so we can't stop early once cwd + first prompt are found.
@@ -106,6 +111,9 @@ fn parse_session(file: PathBuf, full: bool) -> Option<Session> {
             if let Some(c) = v.get("cwd").and_then(Value::as_str) {
                 cwd = Some(c.to_string());
             }
+        }
+        if let Some(ts) = v.get("timestamp").and_then(Value::as_str).and_then(parse_rfc3339) {
+            last_activity = Some(last_activity.map_or(ts, |cur| cur.max(ts)));
         }
         match v.get("type").and_then(Value::as_str) {
             // Claude's own generated session title — the best label when present.
@@ -153,13 +161,47 @@ fn parse_session(file: PathBuf, full: bool) -> Option<Session> {
         cwd,
         label,
         haystack,
-        mtime,
+        mtime: last_activity.unwrap_or(file_mtime),
         file,
     })
 }
 
 fn is_sidechain(v: &Value) -> bool {
     v.get("isSidechain").and_then(Value::as_bool) == Some(true)
+}
+
+/// Parse a UTC RFC 3339 timestamp of the exact form Claude Code emits
+/// (`YYYY-MM-DDTHH:MM:SS(.fff)?Z`) into Unix seconds. Fractional seconds and
+/// any other suffix are ignored since we only need second resolution.
+fn parse_rfc3339(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: u64 = s.get(11..13)?.parse().ok()?;
+    let min: u64 = s.get(14..16)?.parse().ok()?;
+    let sec: u64 = s.get(17..19)?.parse().ok()?;
+    let days = days_from_civil(year, month, day)?;
+    Some((days as u64) * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Days since the Unix epoch for a Gregorian calendar date, via Howard
+/// Hinnant's `days_from_civil` algorithm (proleptic Gregorian, valid for any
+/// real-world date).
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
 }
 
 /// Append whitespace-flattened text to the search haystack. Flattening drops
@@ -588,6 +630,40 @@ mod tests {
         assert_eq!(rel_time_from(172_800, 0), "2d");
         // Clock skew must not underflow.
         assert_eq!(rel_time_from(0, 100), "0s");
+    }
+
+    #[test]
+    fn parse_rfc3339_known_values() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:01.500Z"), Some(1));
+        // 2026-09-21T21:43:13.984Z, cross-checked against Python's datetime.timestamp().
+        assert_eq!(parse_rfc3339("2026-09-21T21:43:13.984Z"), Some(1_790_026_993));
+        assert_eq!(parse_rfc3339("not a timestamp"), None);
+        assert_eq!(parse_rfc3339(""), None);
+    }
+
+    #[test]
+    fn parse_session_uses_last_transcript_timestamp_not_file_mtime() {
+        let dir = std::env::temp_dir().join(format!("crf-ts-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("22222222-3333-4444-5555-666666666666.jsonl");
+        let body = [
+            json!({"type": "user", "cwd": "/tmp", "timestamp": "2026-09-21T21:00:00Z", "message": {"content": "hi"}}),
+            json!({"type": "assistant", "timestamp": "2026-09-21T21:43:13.984Z", "message": {"content": [{"type": "text", "text": "sure"}]}}),
+            // Bookkeeping lines with no timestamp, appended after the real conversation ended.
+            json!({"type": "last-prompt", "lastPrompt": "hi"}),
+            json!({"type": "cost-state", "totalCostUSD": 0.01}),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&file, body).unwrap();
+
+        let s = parse_session(file.clone(), false).expect("session parsed");
+        assert_eq!(s.mtime, 1_790_026_993);
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
