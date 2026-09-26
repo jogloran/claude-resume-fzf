@@ -303,24 +303,12 @@ fn format_row(s: &Session) -> String {
     )
 }
 
-/// Interactive picker: list sessions in fzf, then resume the chosen one.
-/// When `full` is set, the whole transcript is searchable; otherwise fzf
-/// searches only the visible label (title/first prompt) and directory.
-pub fn run(full: bool) -> ! {
-    let sessions = collect_sessions(full);
-    if sessions.is_empty() {
-        eprintln!(
-            "No Claude sessions found under {}",
-            projects_dir().display()
-        );
-        std::process::exit(1);
-    }
-
-    let self_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("claude-resume-fzf"));
-
-    // Build tab-delimited input: display col + hidden cwd/id/file cols.
+/// Build the tab-delimited fzf input: display col + hidden cwd/id/file cols,
+/// one line per session. Shared by the initial list and the `--list`
+/// subcommand fzf calls to reload after a delete.
+fn build_input(full: bool) -> String {
     let mut input = String::new();
-    for s in &sessions {
+    for s in &collect_sessions(full) {
         let display = format_row(s);
         // In full mode the haystack trails the visible label so fzf searches
         // the whole transcript; it sits off-screen (with --no-hscroll) and dimmed.
@@ -336,9 +324,130 @@ pub fn run(full: bool) -> ! {
             s.file.display()
         ));
     }
+    input
+}
+
+/// Delete a session file under `~/.claude/projects`.
+pub fn delete_session(file: &str) {
+    delete_session_under(file, &projects_dir());
+}
+
+/// Delete a session file, refusing anything outside `root` as a safety net
+/// against a malformed or tampered path reaching this command. Also removes
+/// the parent project folder if that was its last session. `root` is
+/// injectable so tests can point it at a scratch directory.
+fn delete_session_under(file: &str, root: &Path) {
+    let path = Path::new(file);
+    let projects = match fs::canonicalize(root) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let canon = match fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if !canon.starts_with(&projects) {
+        eprintln!("refusing to delete outside {}: {}", projects.display(), canon.display());
+        return;
+    }
+    let _ = fs::remove_file(&canon);
+    if let Some(parent) = canon.parent() {
+        if fs::read_dir(parent).is_ok_and(|mut it| it.next().is_none()) {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+}
+
+/// Seconds within which a second ctrl-x on the *same* session confirms the
+/// delete; ctrl-x on a different session (or after the window lapses) just
+/// re-arms instead.
+const CONFIRM_WINDOW_SECS: u64 = 4;
+
+/// Where the pending "armed" delete is recorded between the two ctrl-x
+/// presses (two separate process invocations, since each key press runs a
+/// fresh `execute-silent`). Scoped per-user since /tmp can be shared.
+fn armed_state_path() -> PathBuf {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    std::env::temp_dir().join(format!("ccresume-armed-{user}"))
+}
+
+fn read_armed_state(state_path: &Path) -> Option<(String, u64)> {
+    let s = fs::read_to_string(state_path).ok()?;
+    let (file, ts) = s.split_once('\t')?;
+    Some((file.to_string(), ts.trim().parse().ok()?))
+}
+
+/// True if `file` was armed at `state_path` within the confirm window as of `now`.
+fn is_confirming(file: &str, state_path: &Path, now: u64) -> bool {
+    matches!(
+        read_armed_state(state_path),
+        Some((armed_file, ts)) if armed_file == file && now.saturating_sub(ts) <= CONFIRM_WINDOW_SECS
+    )
+}
+
+/// First ctrl-x on a session arms it (recorded to disk) without deleting.
+/// A second ctrl-x on that *same* session within `CONFIRM_WINDOW_SECS`
+/// deletes it. Anything else (different session, or the window lapsed)
+/// re-arms rather than deleting, so a stray keypress can't destroy the
+/// wrong session.
+pub fn arm_or_delete(file: &str) {
+    arm_or_delete_at(file, &armed_state_path(), &projects_dir());
+}
+
+fn arm_or_delete_at(file: &str, state_path: &Path, root: &Path) {
+    let now = now_secs();
+    if is_confirming(file, state_path, now) {
+        delete_session_under(file, root);
+        let _ = fs::remove_file(state_path);
+        return;
+    }
+    let _ = fs::write(state_path, format!("{file}\t{now}"));
+}
+
+/// Header text for fzf's `transform-header`, reflecting whether `file` is
+/// currently armed for deletion.
+pub fn header_status(file: &str) -> String {
+    header_status_at(file, &armed_state_path())
+}
+
+fn header_status_at(file: &str, state_path: &Path) -> String {
+    if is_confirming(file, state_path, now_secs()) {
+        "enter: resume   ctrl-x again to confirm delete!".to_string()
+    } else {
+        "enter: resume   ctrl-x: delete session".to_string()
+    }
+}
+
+/// Interactive picker: list sessions in fzf, then resume the chosen one.
+/// When `full` is set, the whole transcript is searchable; otherwise fzf
+/// searches only the visible label (title/first prompt) and directory.
+pub fn run(full: bool) -> ! {
+    let input = build_input(full);
+    if input.is_empty() {
+        eprintln!(
+            "No Claude sessions found under {}",
+            projects_dir().display()
+        );
+        std::process::exit(1);
+    }
+
+    let self_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("claude-resume-fzf"));
 
     // Pass the live query to the preview so matches can be highlighted.
     let preview_cmd = format!("{} --preview {{4}} {{q}}", self_exe.display());
+    let list_flag = if full { "--list-full" } else { "--list" };
+    // ctrl-x arms the highlighted session and updates the header to prompt
+    // for confirmation; a second ctrl-x on the same session within a few
+    // seconds actually deletes it and reloads the list in place, without
+    // exiting fzf. execute-silent avoids flashing the screen for the delete;
+    // transform-header re-reads the (just-updated) arm state to show it.
+    let delete_bind = format!(
+        "ctrl-x:execute-silent({exe} --arm-or-delete {{4}})+reload({exe} {list})+transform-header({exe} --header-status {{4}})",
+        exe = self_exe.display(),
+        list = list_flag,
+    );
 
     let mut child = Command::new("fzf")
         .args([
@@ -354,12 +463,15 @@ pub fn run(full: bool) -> ! {
             "--height=100%",
             "--layout=reverse",
             "--preview-window=down:60%:wrap:follow",
+            "--header=enter: resume   ctrl-x: delete session",
         ])
         // Fuzzy matching over a 20 KB transcript blob matches almost everything,
         // so full-text mode uses exact substring matching instead.
         .args(if full { &["--exact"][..] } else { &[][..] })
         .arg("--preview")
         .arg(&preview_cmd)
+        .arg("--bind")
+        .arg(&delete_bind)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -586,6 +698,38 @@ pub fn main_with_args(args: Vec<String>) -> ! {
             }
             std::process::exit(0);
         }
+        // Internal: used by fzf's reload() binding to refresh the list after a delete.
+        Some("--list") => {
+            print!("{}", build_input(false));
+            std::process::exit(0);
+        }
+        Some("--list-full") => {
+            print!("{}", build_input(true));
+            std::process::exit(0);
+        }
+        // Internal: used by fzf's ctrl-x binding. First call on a session arms
+        // it; a second call on the same session within the confirm window
+        // deletes it. Not meant to be run by hand.
+        Some("--arm-or-delete") => {
+            if let Some(file) = args.get(1) {
+                arm_or_delete(file);
+            }
+            std::process::exit(0);
+        }
+        // Internal: used by fzf's transform-header to reflect arm state.
+        Some("--header-status") => {
+            let file = args.get(1).map(String::as_str).unwrap_or("");
+            println!("{}", header_status(file));
+            std::process::exit(0);
+        }
+        // Delete a session outright, no confirmation. Not wired to any fzf
+        // binding; kept as a scriptable escape hatch.
+        Some("--delete") => {
+            if let Some(file) = args.get(1) {
+                delete_session(file);
+            }
+            std::process::exit(0);
+        }
         Some("-h") | Some("--help") => {
             println!(
                 "claude-resume-fzf — fuzzy-find and resume Claude Code sessions\n\n\
@@ -598,6 +742,7 @@ pub fn main_with_args(args: Vec<String>) -> ! {
                  \x20 -h, --help    show this help and exit\n\n\
                  Keys (inside fzf):\n\
                  \x20 Enter         resume the selected session in its directory\n\
+                 \x20 ctrl-x        press twice to delete the selected session\n\
                  \x20 Esc           quit without doing anything"
             );
             std::process::exit(0);
@@ -630,6 +775,147 @@ mod tests {
         // Only tool blocks -> nothing printable.
         let tool_only = json!([{"type": "tool_result", "content": "x"}]);
         assert_eq!(text_from_content(&tool_only), None);
+    }
+
+    #[test]
+    fn delete_session_removes_file_and_empty_parent() {
+        let root = std::env::temp_dir().join(format!("crf-delete-test-{}", std::process::id()));
+        let proj_dir = root.join("-tmp-someproject");
+        fs::create_dir_all(&proj_dir).unwrap();
+        let file = proj_dir.join("session-a.jsonl");
+        fs::write(&file, "{}").unwrap();
+
+        delete_session_under(file.to_str().unwrap(), &root);
+
+        assert!(!file.exists());
+        assert!(!proj_dir.exists(), "empty parent project dir should be removed too");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_session_keeps_parent_with_other_sessions() {
+        let root = std::env::temp_dir().join(format!("crf-delete-test2-{}", std::process::id()));
+        let proj_dir = root.join("-tmp-someproject");
+        fs::create_dir_all(&proj_dir).unwrap();
+        let file_a = proj_dir.join("session-a.jsonl");
+        let file_b = proj_dir.join("session-b.jsonl");
+        fs::write(&file_a, "{}").unwrap();
+        fs::write(&file_b, "{}").unwrap();
+
+        delete_session_under(file_a.to_str().unwrap(), &root);
+
+        assert!(!file_a.exists());
+        assert!(proj_dir.exists(), "parent dir still has session-b, must stay");
+        assert!(file_b.exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_session_refuses_path_outside_root() {
+        let root = std::env::temp_dir().join(format!("crf-delete-test3-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let outside = std::env::temp_dir().join(format!("crf-outside-{}.jsonl", std::process::id()));
+        fs::write(&outside, "{}").unwrap();
+
+        delete_session_under(outside.to_str().unwrap(), &root);
+
+        assert!(outside.exists(), "must not delete anything outside root");
+
+        fs::remove_file(&outside).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn first_ctrl_x_arms_without_deleting() {
+        let root = std::env::temp_dir().join(format!("crf-arm-test-{}", std::process::id()));
+        let proj_dir = root.join("-tmp-someproject");
+        fs::create_dir_all(&proj_dir).unwrap();
+        let file = proj_dir.join("session-a.jsonl");
+        fs::write(&file, "{}").unwrap();
+        let state = root.join("armed-state");
+
+        arm_or_delete_at(file.to_str().unwrap(), &state, &root);
+
+        assert!(file.exists(), "first press must only arm, not delete");
+        assert_eq!(
+            header_status_at(file.to_str().unwrap(), &state),
+            "enter: resume   ctrl-x again to confirm delete!"
+        );
+        // A different session shouldn't show as armed even while this one is.
+        assert_eq!(
+            header_status_at("/somewhere/else.jsonl", &state),
+            "enter: resume   ctrl-x: delete session"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn second_ctrl_x_on_same_session_deletes() {
+        let root = std::env::temp_dir().join(format!("crf-arm-test2-{}", std::process::id()));
+        let proj_dir = root.join("-tmp-someproject");
+        fs::create_dir_all(&proj_dir).unwrap();
+        let file = proj_dir.join("session-a.jsonl");
+        fs::write(&file, "{}").unwrap();
+        let state = root.join("armed-state");
+        let f = file.to_str().unwrap();
+
+        arm_or_delete_at(f, &state, &root); // arm
+        arm_or_delete_at(f, &state, &root); // confirm
+
+        assert!(!file.exists(), "second press on the same session must delete");
+        assert!(
+            !state.exists(),
+            "arm state should be cleared after a confirmed delete"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ctrl_x_on_a_different_session_rearms_instead_of_deleting() {
+        let root = std::env::temp_dir().join(format!("crf-arm-test3-{}", std::process::id()));
+        let proj_dir = root.join("-tmp-someproject");
+        fs::create_dir_all(&proj_dir).unwrap();
+        let file_a = proj_dir.join("session-a.jsonl");
+        let file_b = proj_dir.join("session-b.jsonl");
+        fs::write(&file_a, "{}").unwrap();
+        fs::write(&file_b, "{}").unwrap();
+        let state = root.join("armed-state");
+
+        arm_or_delete_at(file_a.to_str().unwrap(), &state, &root); // arm a
+        arm_or_delete_at(file_b.to_str().unwrap(), &state, &root); // move to b
+
+        assert!(file_a.exists(), "switching selection must not delete the old arm target");
+        assert!(file_b.exists(), "moving to a new session only re-arms it");
+        assert_eq!(
+            header_status_at(file_b.to_str().unwrap(), &state),
+            "enter: resume   ctrl-x again to confirm delete!"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn stale_arm_past_the_confirm_window_rearms_instead_of_deleting() {
+        let root = std::env::temp_dir().join(format!("crf-arm-test4-{}", std::process::id()));
+        let proj_dir = root.join("-tmp-someproject");
+        fs::create_dir_all(&proj_dir).unwrap();
+        let file = proj_dir.join("session-a.jsonl");
+        fs::write(&file, "{}").unwrap();
+        let state = root.join("armed-state");
+        let f = file.to_str().unwrap();
+
+        // Simulate an arm from long ago, past CONFIRM_WINDOW_SECS.
+        fs::write(&state, format!("{f}\t{}", now_secs() - CONFIRM_WINDOW_SECS - 1)).unwrap();
+
+        arm_or_delete_at(f, &state, &root);
+
+        assert!(file.exists(), "a stale arm must not silently confirm a delete");
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
