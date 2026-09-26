@@ -256,11 +256,33 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn rel_time(mtime: u64) -> String {
-    rel_time_from(now_secs(), mtime)
+/// Local timezone's current offset from UTC, in seconds.
+fn local_utc_offset(now: u64) -> i64 {
+    let t = now as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return 0;
+    }
+    #[allow(clippy::useless_conversion)] // c_long is i32 on 32-bit targets
+    i64::from(tm.tm_gmtoff)
 }
 
-fn rel_time_from(now: u64, mtime: u64) -> String {
+fn rel_time(mtime: u64) -> String {
+    let now = now_secs();
+    rel_time_from(now, mtime, local_utc_offset(now))
+}
+
+const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"]; // day 0 = 1970-01-01
+
+/// Before today's local midnight but within the previous 6 days, show the
+/// weekday name; otherwise a relative age. Uses today's UTC offset for the
+/// whole week, so a DST change in that window can shift the boundary by an hour.
+fn rel_time_from(now: u64, mtime: u64, utc_offset: i64) -> String {
+    let local_day = |t: u64| (t as i64 + utc_offset).div_euclid(86400);
+    let days_ago = local_day(now) - local_day(mtime);
+    if (1..7).contains(&days_ago) {
+        return WEEKDAYS[local_day(mtime).rem_euclid(7) as usize].to_string();
+    }
     let d = now.saturating_sub(mtime);
     if d < 60 {
         format!("{d}s")
@@ -912,12 +934,30 @@ mod tests {
 
     #[test]
     fn rel_time_buckets() {
-        assert_eq!(rel_time_from(30, 0), "30s");
-        assert_eq!(rel_time_from(120, 0), "2m");
-        assert_eq!(rel_time_from(7200, 0), "2h");
-        assert_eq!(rel_time_from(172_800, 0), "2d");
+        assert_eq!(rel_time_from(30, 0, 0), "30s");
+        assert_eq!(rel_time_from(120, 0, 0), "2m");
+        assert_eq!(rel_time_from(7200, 0, 0), "2h");
+        assert_eq!(rel_time_from(8 * 86400, 0, 0), "8d");
         // Clock skew must not underflow.
-        assert_eq!(rel_time_from(0, 100), "0s");
+        assert_eq!(rel_time_from(0, 100, 0), "0s");
+    }
+
+    #[test]
+    fn rel_time_weekday_names_within_past_week() {
+        // 2026-09-25 (Fri) 10:00 UTC.
+        let now = 1_790_330_400;
+        let h = 3600;
+        // Earlier today stays relative.
+        assert_eq!(rel_time_from(now, now - 9 * h, 0), "9h");
+        // Just before midnight yesterday.
+        assert_eq!(rel_time_from(now, now - 10 * h - 1, 0), "Thu");
+        assert_eq!(rel_time_from(now, now - 3 * 86400, 0), "Tue");
+        assert_eq!(rel_time_from(now, now - 6 * 86400, 0), "Sat");
+        // A week ago falls back to the day count, not an ambiguous "Fri".
+        assert_eq!(rel_time_from(now, now - 7 * 86400, 0), "7d");
+        // Local midnight respects the UTC offset: 11h back is still "today" at UTC+2.
+        assert_eq!(rel_time_from(now, now - 11 * h, 2 * h as i64), "11h");
+        assert_eq!(rel_time_from(now, now - 11 * h, 0), "Thu");
     }
 
     #[test]
