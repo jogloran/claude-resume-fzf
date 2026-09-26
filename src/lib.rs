@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use termimad::MadSkin;
 
 /// One resumable Claude Code session.
 struct Session {
@@ -435,8 +436,7 @@ pub fn run(full: bool) -> ! {
 
     let self_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("claude-resume-fzf"));
 
-    // Pass the live query to the preview so matches can be highlighted.
-    let preview_cmd = format!("{} --preview {{4}} {{q}}", self_exe.display());
+    let preview_cmd = format!("{} --preview {{4}}", self_exe.display());
     let list_flag = if full { "--list-full" } else { "--list" };
     // ctrl-x arms the highlighted session and updates the header to prompt
     // for confirmation; a second ctrl-x on the same session within a few
@@ -520,8 +520,7 @@ pub fn run(full: bool) -> ! {
 }
 
 /// Render a readable preview of a session file for fzf's preview pane.
-/// `query` is fzf's live search string; matching terms are highlighted.
-pub fn preview(file: &str, query: &str) {
+pub fn preview(file: &str) {
     let f = match fs::File::open(file) {
         Ok(f) => f,
         Err(e) => {
@@ -587,12 +586,20 @@ pub fn preview(file: &str, query: &str) {
         let _ = writeln!(out, "{CYAN}claude:{RESET} {ver}");
     }
     let width = preview_width();
+    let skin = preview_skin();
     if let Some(lp) = &last_prompt {
-        write_wrapped(&mut out, "latest:", CYAN, &truncate(lp, 800), query, width);
+        write_markdown(&mut out, &skin, "latest:", CYAN, &truncate_preserving_structure(lp, 800), width);
     }
     let _ = writeln!(out, "{DIM}{}{RESET}", "─".repeat(40));
     for (label, color, text) in turns.iter().take(40) {
-        write_wrapped(&mut out, &format!("{label}:"), color, &truncate(text, 1200), query, width);
+        write_markdown(
+            &mut out,
+            &skin,
+            &format!("{label}:"),
+            color,
+            &truncate_preserving_structure(text, 4000),
+            width,
+        );
     }
 }
 
@@ -606,69 +613,36 @@ fn preview_width() -> usize {
         .unwrap_or(80)
 }
 
-/// Word-wrap `text` to `width` columns, printing a `label:` prefix on the
-/// first line and aligning continuation lines under it. Wrapping happens
-/// before highlighting so embedded ANSI codes never skew the wrap width.
-fn write_wrapped(
-    out: &mut impl Write,
-    label: &str,
-    color: &str,
-    text: &str,
-    query: &str,
-    width: usize,
-) {
-    let prefix = format!("{label} ");
-    let indent = " ".repeat(prefix.chars().count());
-    let body_width = width.saturating_sub(indent.len()).max(10);
-    for (i, line) in textwrap::wrap(text, body_width).iter().enumerate() {
-        let hl = highlight(line, query);
-        if i == 0 {
-            let _ = writeln!(out, "{color}{prefix}{RESET}{hl}");
-        } else {
-            let _ = writeln!(out, "{indent}{hl}");
-        }
+/// Skin termimad uses to render message bodies. Left mostly at termimad's
+/// defaults (tuned for a dark terminal); only bold is nudged to match the
+/// rest of the preview's cyan accent instead of termimad's default white.
+fn preview_skin() -> MadSkin {
+    let mut skin = MadSkin::default();
+    skin.bold.set_fg(termimad::crossterm::style::Color::Cyan);
+    skin
+}
+
+/// Print a `label:` line, then `text` rendered as Markdown (headers, bold,
+/// code blocks, lists, ...) via termimad, indented two spaces under it.
+fn write_markdown(out: &mut impl Write, skin: &MadSkin, label: &str, color: &str, text: &str, width: usize) {
+    let _ = writeln!(out, "{color}{label}{RESET}");
+    let rendered = skin.text(text, Some(width.saturating_sub(2).max(10))).to_string();
+    for line in rendered.lines() {
+        let _ = writeln!(out, "  {line}");
     }
 }
 
-/// Wrap case-insensitive occurrences of each query term in a highlight color.
-/// ASCII-only matching keeps byte offsets aligned with char boundaries.
-fn highlight(text: &str, query: &str) -> String {
-    const HL: &str = "\x1b[43;30m"; // black on yellow
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .map(str::to_ascii_lowercase)
-        .filter(|t| !t.is_empty())
-        .collect();
-    if terms.is_empty() {
-        return text.to_string();
+/// Truncate `text` to at most `max_chars`, preserving newlines so Markdown
+/// structure (code fences, lists, paragraphs) survives for the renderer —
+/// unlike `truncate()`, which flattens everything to one line for the
+/// single-line list row.
+fn truncate_preserving_structure(text: &str, max_chars: usize) -> String {
+    if text.chars().count() > max_chars {
+        let t: String = text.chars().take(max_chars).collect();
+        format!("{t}…")
+    } else {
+        text.to_string()
     }
-    let lower = text.to_ascii_lowercase();
-    let mut marks = vec![false; text.len()];
-    for term in &terms {
-        let mut from = 0;
-        while let Some(pos) = lower[from..].find(term.as_str()) {
-            let s = from + pos;
-            let e = s + term.len();
-            marks[s..e].iter_mut().for_each(|m| *m = true);
-            from = e;
-        }
-    }
-    let mut out = String::new();
-    let mut inside = false;
-    for (i, ch) in text.char_indices() {
-        if marks[i] && !inside {
-            out.push_str(HL);
-            inside = true;
-        } else if !marks[i] && inside {
-            out.push_str(RESET);
-            inside = false;
-        }
-        out.push(ch);
-    }
-    if inside {
-        out.push_str(RESET);
-    }
-    out
 }
 
 /// Extract a printable transcript turn from a message entry, if any.
@@ -693,8 +667,7 @@ pub fn main_with_args(args: Vec<String>) -> ! {
     match args.first().map(String::as_str) {
         Some("--preview") => {
             if let Some(file) = args.get(1) {
-                let query = args.get(2).map(String::as_str).unwrap_or("");
-                preview(file, query);
+                preview(file);
             }
             std::process::exit(0);
         }
@@ -924,6 +897,16 @@ mod tests {
         let long = "x".repeat(100);
         let out = truncate(&long, 10);
         assert_eq!(out.chars().count(), 10);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_preserving_structure_keeps_newlines() {
+        let md = "line one\n\n- a\n- b\n\n```\ncode\n```";
+        assert_eq!(truncate_preserving_structure(md, 1000), md);
+        let long = "x".repeat(100);
+        let out = truncate_preserving_structure(&long, 10);
+        assert_eq!(out.chars().count(), 11); // 10 chars + ellipsis
         assert!(out.ends_with('…'));
     }
 
